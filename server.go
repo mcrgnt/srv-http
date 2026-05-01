@@ -3,56 +3,46 @@ package srvhttp
 import (
 	"context"
 	"errors"
-	"fmt"
 	"net"
 	"net/http"
 
-	commonv1 "github.com/mcrgnt/proto/gen/go/common/v1"
-	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"github.com/slok/go-http-metrics/metrics"
 	"go.uber.org/atomic"
 )
 
-type Config struct {
-	Label commonv1.Label
-	Host  commonv1.Host
-	Port  commonv1.Port
-}
-
-func (cfg *Config) Build() (any, error) {
-	listener, err := net.Listen("tcp", fmt.Sprintf("%s:%d", cfg.Host.Value, cfg.Port.Value))
-	if err != nil {
-		return nil, err
-	}
-	return &srv{
-		config:   cfg,
-		Server:   http.Server{},
-		listener: listener,
-	}, nil
-}
-
-type srv struct {
-	config *Config
+type srv[T http.Handler] struct {
+	initFn func(t *srv[T])
 	http.Server
-	handler  http.Handler `deps:""`
+	handler  T `deps:""`
 	listener net.Listener
 	err      atomic.Error
+	recorder metrics.Recorder
 }
 
-func (t *srv) Label() string {
-	return t.config.Label.String()
+func (r *srv[T]) Deps() []any {
+	return []any{
+		(*T)(nil),
+		(*metrics.Recorder)(nil),
+	}
 }
 
-func (t *srv) Start(ctx context.Context) error {
+func (r *srv[T]) Inject(args []any) {
+	for _, arg := range args {
+		switch v := arg.(type) {
+		case T:
+			r.Handler = v
+		case metrics.Recorder:
+			r.recorder = v
+		}
+	}
+}
+
+func (t *srv[T]) Start(ctx context.Context) error {
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
 	default:
-		if t.Handler != nil {
-			t.Handler = otelhttp.NewHandler(t.Handler, t.config.Label.String())
-		}
-		t.BaseContext = func(net.Listener) context.Context {
-			return ctx
-		}
+		t.initFn(t)
 
 		go func() {
 			if err := t.Serve(t.listener); err != nil {
@@ -65,7 +55,7 @@ func (t *srv) Start(ctx context.Context) error {
 	}
 }
 
-func (t *srv) Close(ctx context.Context) error {
+func (t *srv[T]) Close(ctx context.Context) error {
 	if err := t.Shutdown(ctx); err != nil {
 		if !errors.Is(err, http.ErrServerClosed) {
 			return err
@@ -74,10 +64,6 @@ func (t *srv) Close(ctx context.Context) error {
 	return nil
 }
 
-func (t *srv) HealthCheck(context.Context) error {
-	var err = t.err.Load()
-	if err != nil {
-		return err
-	}
-	return nil
+func (t *srv[T]) HealthCheck(_ context.Context) error {
+	return t.err.Load()
 }
